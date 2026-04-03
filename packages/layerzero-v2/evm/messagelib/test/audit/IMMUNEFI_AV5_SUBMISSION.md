@@ -139,13 +139,21 @@ Demonstrates the full payload overwrite attack chain:
 
 Demonstrates an alternative destruction path using only built-in protocol operations (no external DVN deployment). The delegate chains nilify → skip → burn to permanently destroy a verified message. This test is supplementary — it demonstrates the breadth of delegate power and supports the recommendation for timelocked config/operation changes rather than being a standalone finding.
 
+**Test 4: `test_AV5_9_ConfigPersistsAfterDelegateRevocation`** (supplementary)
+
+Demonstrates that ULN config changes persist after delegate revocation. The OApp owner revokes the compromised delegate, but the weakened config (malicious DVN + 0 confirmations) remains active. A malicious DVN can still commit fraudulent messages AFTER the delegate is revoked. The OApp owner must manually restore the config — delegate revocation alone is insufficient. The test also confirms the OApp owner CAN manually restore configs, so this is an operational awareness gap.
+
+**Test 5: `test_AV5_10_NilifiedNonceResurrection`** (supplementary)
+
+Demonstrates that a nilified nonce can be "resurrected" via re-verification. After `nilify()` sets the hash to `NIL_PAYLOAD_HASH` (`type(uint256).max`), the `_verifiable()` check still returns true because `NIL_PAYLOAD_HASH != EMPTY_PAYLOAD_HASH` (bytes32(0)). A compromised delegate can change the DVN config and have a malicious DVN re-verify the nilified nonce with an attacker-controlled payload hash, overwriting the nilification. This demonstrates that `nilify()` does not provide permanent discarding — only `nilify + skip + burn` (Test 3) is truly permanent.
+
 Run the tests:
 
 ```bash
 forge test --match-path test/audit/05_AccessControl.t.sol -vvv
 ```
 
-All tests pass, confirming the vulnerability exists in the current codebase.
+All 10 tests pass, confirming the vulnerabilities exist in the current codebase.
 
 ## Distinction from Previously Submitted Finding (AV3+AV6)
 
@@ -185,4 +193,4 @@ function _inbound(..., bytes32 _payloadHash) internal {
 
 **Option D (close the NIL_CONFIRMATIONS gap for OApp configs):** `NIL_CONFIRMATIONS` is already blocked for default configs at `UlnBase.sol:62`. The same validation should apply when OApp-level configs are set: reject a DVN-set change or confirmation override that would resolve to 0 effective confirmations unless the default itself specifies 0.
 
-Option A is strongly recommended as it closes both this attack vector and AV3+AV6 at the source. Options B–D are complementary mitigations that address contributing factors.
+Option A is strongly recommended as it closes both this attack vector and AV3+AV6 at the source, and also prevents nilified nonce resurrection (Test 5). Options B–D are complementary mitigations that address contributing factors.
