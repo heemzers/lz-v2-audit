@@ -82,6 +82,16 @@ The OApp admin can nilify/burn using the malicious hash to "clean up" the slot, 
 
 **Severity justification:** This is a permissionless attack requiring no trust assumption violation. Any user paying lzToken fees is vulnerable. The attacker needs only to monitor the mempool and front-run.
 
+**Escalation - EndpointV2Alt (AV4.5):**
+EndpointV2Alt._suppliedNative() uses the identical `balanceOf(address(this))` pattern for native ERC20 fees (line 39-41). On L2 chains using EndpointV2Alt, the front-running attack applies to ALL messages (native fees are required on every message, unlike lzToken which requires `lzTokenEnabled`). This significantly broadens the attack surface.
+
+**PoC:** `test/audit/04_FeeExploit.t.sol::test_AV4_5_EndpointV2Alt_NativeErc20_SameVulnerability` (PASSING)
+
+**Mitigating factors:**
+- OAppSender bundles transfer+send atomically via `safeTransferFrom` (line 122), so standard OApp/OFT users are NOT vulnerable via the SDK path
+- Users/scripts that call `lzToken.transfer(endpoint, ...)` then `endpoint.send(...)` as separate transactions ARE vulnerable
+- Any custom OApp not using OAppSender is exposed
+
 **Recommendation:**
 - Use `transferFrom` pattern instead of pre-transfer + balanceOf
 - Track per-sender deposits in a mapping
