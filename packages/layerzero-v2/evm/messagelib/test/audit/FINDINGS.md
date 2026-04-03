@@ -105,6 +105,38 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 **Mitigating factor:** Nilify, skip, and burn are designed delegate powers. This is a trust model concern (delegate has too much instant, untimelocked power) rather than a logic bug.
 
+### [MEDIUM] Config Changes Persist After Delegate Revocation (AV5.9)
+
+**Files:**
+- `messagelib/contracts/uln/UlnBase.sol:151-185` (_setUlnConfig — writes persist independently of delegate status)
+- `protocol/contracts/EndpointV2.sol:327-330` (setDelegate — only changes delegate mapping, not configs)
+
+**Impact:** When an OApp owner detects delegate compromise and revokes the delegate via `setDelegate(address(0))`, all config changes previously made by the delegate persist. The weakened ULN config (e.g., malicious DVN + 0 confirmations) remains active and exploitable until the OApp owner manually restores the config. Config persistence is expected key-value-store behavior, but the operational gap is that revoking a delegate provides false security if the owner doesn't also manually audit and restore all configs.
+
+**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_9_ConfigPersistsAfterDelegateRevocation`
+
+**Mitigating factor:** OApp owner CAN manually restore configs. This is an operational awareness gap, not a protocol logic bug. Strengthens the AV5.6 case by demonstrating that delegate revocation is not a complete response to compromise.
+
+### [MEDIUM-HIGH] Nilified Nonces Can Be Resurrected via Re-verification (AV5.10)
+
+**Files:**
+- `protocol/contracts/EndpointV2.sol:344-352` (_verifiable — returns true when hash != empty)
+- `protocol/contracts/MessagingChannel.sol:95-105` (nilify — sets hash to NIL_PAYLOAD_HASH, not EMPTY)
+
+**Impact:** After an OApp nilifies a nonce (setting hash to `NIL_PAYLOAD_HASH = type(uint256).max`), the `_verifiable()` check still returns true because `NIL_PAYLOAD_HASH != EMPTY_PAYLOAD_HASH`. A compromised delegate can exploit this by changing the DVN config and having a malicious DVN re-verify the nilified nonce with an attacker-controlled payload hash. `commitVerification()` then overwrites `NIL_PAYLOAD_HASH` with the attacker's hash, effectively "resurrecting" a nonce that the OApp marked as discarded.
+
+**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_10_NilifiedNonceResurrection`
+
+**Attack Flow:**
+1. Legitimate message committed, OApp nilifies it (hash → NIL_PAYLOAD_HASH)
+2. `_verifiable()` returns true (NIL_PAYLOAD_HASH != EMPTY_PAYLOAD_HASH)
+3. Delegate changes config to malicious DVN + NIL_CONFIRMATIONS
+4. Malicious DVN re-verifies with attacker payload hash
+5. `commitVerification()` overwrites NIL_PAYLOAD_HASH with attacker hash
+6. Nilification is UNDONE — nonce is now executable with attacker-controlled payload
+
+**Mitigating factor:** Requires compromised delegate (same trust assumption as AV5.6).
+
 ---
 
 ## Medium Findings
@@ -161,9 +193,12 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 **Impact:** `_verify()` unconditionally overwrites the stored `Verification` struct. Since `verify.selector` bypasses `usedHashes` replay protection in `DVN.execute()`, a DVN can downgrade its previously submitted confirmation count by calling `verify()` again with a lower value. This can:
 1. Block message delivery (DoS) by reducing confirmations below the required threshold
-2. Enable the payload overwrite chain (AV5.6) when combined with delegate config changes
+2. Restore delivery by re-verifying with high confirmations — enabling selective censorship
+3. Enable the payload overwrite chain (AV5.6) when combined with delegate config changes
 
-**PoC:** `test/audit/02_SignatureReplay.t.sol::test_AV2_2_VerifySelectorSkipsHashCheck`
+**PoC:**
+- `test/audit/02_SignatureReplay.t.sol::test_AV2_2_VerifySelectorSkipsHashCheck`
+- `test/audit/02_SignatureReplay.t.sol::test_AV2_2b_ConfirmationDowngradeBlocksDelivery` (demonstrates toggling)
 
 **Mitigating factor:** Requires DVN key compromise (trust assumption).
 
@@ -194,6 +229,18 @@ A compromised DVN signer quorum can approve arbitrary ERC20 calls via `execute()
 Compromised delegate can call `setSendLibrary(oapp, eid, blockedLibrary)` to route all outbound messages through the blocked library, which reverts on both `send()` and `quote()`. Recoverable if the OApp owner can call `setSendLibrary()` directly, but causes operational disruption.
 **PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_8_DelegateSendLibSwap_BlocksOutbound`
 
+### Compose Front-Running (OApp-Level, Not Protocol)
+`endpoint.lzCompose()` has no access control beyond the compose hash check. Anyone who knows the compose message (emitted in `ComposeSent` event) can call `lzCompose()` before the executor, delivering with `value=0` and forged `_extraData`. The protocol explicitly documents "the composer MUST assert the sender" (MessagingComposer.sol:17). This is an OApp-developer trap, not a protocol bug — the security burden is on each compose receiver to validate `msg.sender == endpoint` and check `msg.value`.
+
+### Treasury Fee System Is DoS-Resistant
+`_payTreasury()` uses `safeCall` with gas limit + return data cap. If treasury reverts or returns garbage, fee = 0 and message proceeds. Native fees are capped at `max(totalNativeFee, treasuryNativeFeeCap)`. lzToken fees are uncapped (documented design choice). No protocol-level vulnerability.
+
+### Worker Fee Accounting Is Correct
+`fees[worker] += amount` properly tracks native fees per worker. `_debitFee(amount)` checks `fees[msg.sender]` before withdrawal. `withdrawLzTokenFee()` lacks accounting (see AV4.4/4.5 above), but native fee path is solid.
+
+### Config Resolution Is Defense-in-Depth
+All five edge cases tested (no default config, DVN array mismatch, NIL_DVN_COUNT, non-existent EID, partial override). `_assertAtLeastOneDVN` catch-all prevents zero-DVN configs. `_assertSupportedEid` blocks configs for non-existent EIDs. Field-group-atomic resolution prevents cross-source field mixing.
+
 ### Reentrancy Protection Is Solid (AV7)
 CEI pattern is consistently applied. `lzReceive` clears payload before external call. `sendContext` modifier prevents re-entry to `send()`. ReentrantReceiver test confirms protection.
 
@@ -215,8 +262,13 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
    - Strengthens AV5 submission by showing delegate power extends beyond config manipulation
 
 ### Consider Submitting
-4. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
-5. **AV4.3 (MEDIUM):** lzToken balance race condition
+4. **AV5.10 (MEDIUM-HIGH):** Nilified nonce resurrection via re-verification
+5. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
+6. **AV4.3 (MEDIUM):** lzToken balance race condition
+
+### Supplementary Evidence (bundle with AV5 submission)
+- **AV5.9 (MEDIUM):** Config persistence after delegate revocation — strengthens AV5 case
+- **AV2.2b:** DVN confirmation downgrade as DoS vector — shows verify replay enables selective censorship
 
 ---
 
@@ -225,12 +277,12 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
 | File | Tests | Status |
 |------|-------|--------|
 | 01_QuorumBypass.t.sol | 7 | ALL PASS |
-| 02_SignatureReplay.t.sol | 4 | ALL PASS |
+| 02_SignatureReplay.t.sol | 5 | ALL PASS |
 | 03_NonceManipulation.t.sol | 3 | ALL PASS |
 | 04_FeeExploit.t.sol | 6 | ALL PASS |
-| 05_AccessControl.t.sol | 8 | ALL PASS |
+| 05_AccessControl.t.sol | 10 | ALL PASS |
 | 06_GracePeriod.t.sol | 4 | ALL PASS |
 | 07_Reentrancy.t.sol | 3 | ALL PASS |
 | 08_LzTokenDrain.t.sol | 3 | ALL PASS |
 | 09_CriticalPoC.t.sol | 3 | ALL PASS |
-| **TOTAL** | **41** | **ALL PASS** |
+| **TOTAL** | **44** | **ALL PASS** |

