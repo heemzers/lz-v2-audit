@@ -82,6 +82,27 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 **Note:** This is the same root cause as the payload overwrite above but demonstrates the quorum reduction angle rather than the payload overwrite angle.
 
+### [HIGH] Delegate Nilify-Skip-Burn - Permanent Message Destruction (AV5.7)
+
+**Files:**
+- `protocol/contracts/MessagingChannel.sol:95-105` (nilify - sets hash to NIL_PAYLOAD_HASH)
+- `protocol/contracts/MessagingChannel.sol:82-88` (skip - advances lazyInboundNonce)
+- `protocol/contracts/MessagingChannel.sol:112-121` (burn - deletes hash permanently)
+- `protocol/contracts/EndpointV2.sol:355-357` (_assertAuthorized - delegate has full power)
+
+**Impact:** A compromised delegate can permanently destroy a verified-but-not-yet-executed message by chaining three protocol operations: nilify (changes hash to NIL_PAYLOAD_HASH), skip (advances lazyInboundNonce past the target nonce), burn (deletes the hash entirely). After burn, the nonce can never be re-verified because `_verifiable()` requires either `nonce > lazyInboundNonce` (fails: nonce <= lazyInboundNonce) or `hash != EMPTY` (fails: hash was deleted). The original cross-chain message is permanently lost.
+
+**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction`
+
+**Attack Flow:**
+1. Legitimate message committed at nonce 1 (hash stored in endpoint)
+2. Delegate calls `nilify(oapp, srcEid, sender, 1, payloadHash)` - hash becomes NIL_PAYLOAD_HASH
+3. Delegate calls `skip(oapp, srcEid, sender, 2)` - advances lazyInboundNonce to 2
+4. Delegate calls `burn(oapp, srcEid, sender, 1, NIL_PAYLOAD_HASH)` - deletes hash permanently
+5. Nonce 1 is permanently dead: `_verifiable()` returns false, no re-verification possible
+
+**Why This Matters:** Unlike the config retroactivity attack (AV5.6), this path requires NO external DVN deployment. The delegate uses only built-in protocol operations (nilify, skip, burn) in their intended sequence, but the cumulative effect is permanent fund destruction. Each operation individually seems safe; the chain is the vulnerability.
+
 ---
 
 ## Medium Findings
@@ -163,6 +184,14 @@ When `DVN.execute()` fails, `usedHashes[hash]` is reset to false, allowing the s
 A compromised DVN signer quorum can approve arbitrary ERC20 calls via `execute()`, draining tokens held by the DVN contract. Requires signer key compromise.
 **PoC:** `test/audit/08_LzTokenDrain.t.sol::test_AV8_1_ArbitraryCallTarget`
 
+### EndpointV2Alt Native Fee Race Condition
+`EndpointV2Alt._suppliedNative()` uses `IERC20(nativeErc20).balanceOf(address(this))` instead of `msg.value`. This means the same shared-balance race condition that affects lzToken fees in EndpointV2 also affects native fees on Alt chains (non-ETH chains like some L2s). More impactful than AV4.3 since native fees are required for ALL messages, not just lzToken-paying ones. Same mitigation: standard OApp flow is atomic.
+**File:** `protocol/contracts/EndpointV2Alt.sol:39-41`
+
+### Delegate Can Block Outbound Messages via Library Swap (AV5.8)
+Compromised delegate can call `setSendLibrary(oapp, eid, blockedLibrary)` to route all outbound messages through the blocked library, which reverts on both `send()` and `quote()`. Recoverable if the OApp owner can call `setSendLibrary()` directly, but causes operational disruption.
+**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_8_DelegateSendLibSwap_BlocksOutbound`
+
 ### Reentrancy Protection Is Solid (AV7)
 CEI pattern is consistently applied. `lzReceive` clears payload before external call. `sendContext` modifier prevents re-entry to `send()`. ReentrantReceiver test confirms protection.
 
@@ -178,10 +207,14 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
    - Different root cause than AV3+AV6 (config manipulation vs. library upgrade)
    - Demonstrates that `_inbound()` overwrite is exploitable through MULTIPLE paths
    - Strong case for fixing `_inbound()` rather than just the grace period path
+3. **AV5.7 (HIGH):** Delegate nilify-skip-burn permanent message destruction
+   - No external DVN needed -- uses only built-in protocol operations
+   - 3-step chain: nilify -> skip -> burn permanently kills a verified nonce
+   - Strengthens AV5 submission by showing delegate power extends beyond config manipulation
 
 ### Consider Submitting
-3. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
-4. **AV4.3 (MEDIUM):** lzToken balance race condition
+4. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
+5. **AV4.3 (MEDIUM):** lzToken balance race condition
 
 ---
 
@@ -193,9 +226,9 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
 | 02_SignatureReplay.t.sol | 4 | ALL PASS |
 | 03_NonceManipulation.t.sol | 3 | ALL PASS |
 | 04_FeeExploit.t.sol | 6 | ALL PASS |
-| 05_AccessControl.t.sol | 6 | ALL PASS |
+| 05_AccessControl.t.sol | 8 | ALL PASS |
 | 06_GracePeriod.t.sol | 4 | ALL PASS |
 | 07_Reentrancy.t.sol | 3 | ALL PASS |
 | 08_LzTokenDrain.t.sol | 3 | ALL PASS |
 | 09_CriticalPoC.t.sol | 3 | ALL PASS |
-| **TOTAL** | **39** | **ALL PASS** |
+| **TOTAL** | **41** | **ALL PASS** |

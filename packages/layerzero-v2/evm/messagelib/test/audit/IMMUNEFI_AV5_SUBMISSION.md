@@ -44,17 +44,18 @@ function commitVerification(bytes calldata _packetHeader, bytes32 _payloadHash) 
 }
 ```
 
-**NIL_CONFIRMATIONS silently resolves to 0 for OApp configs** (`UlnBase.sol:79-85`):
+**NIL_CONFIRMATIONS always resolves to 0 for OApp configs** (`UlnBase.sol:79-85`):
 
 ```solidity
-// type(uint64).max is the sentinel for "use default"
-// For OApp configs, this resolves to the default value, which can be 0
-if (rtnConfig.confirmations == NIL_CONFIRMATIONS) {
+uint64 confirmations = customConfig.confirmations;
+if (confirmations == DEFAULT) {
     rtnConfig.confirmations = defaultConfig.confirmations;
-}
+} else if (confirmations != NIL_CONFIRMATIONS) {
+    rtnConfig.confirmations = confirmations;
+} // else do nothing, rtnConfig.confirmation is 0
 ```
 
-When no default is set (or default confirmations is 0), setting `confirmations = type(uint64).max` in an OApp config effectively disables the confirmation requirement.
+When an OApp sets `confirmations = type(uint64).max` (NIL_CONFIRMATIONS), neither branch executes — `rtnConfig.confirmations` remains at its default memory value of `0`, **regardless of what the default config specifies**. Even if the default config has `confirmations = 20`, the OApp override to NIL_CONFIRMATIONS always produces 0. This unconditionally disables the block confirmation requirement.
 
 **`_inbound()` performs an unconditional overwrite** (`MessagingChannel.sol:37-46`):
 
@@ -133,6 +134,14 @@ Demonstrates the full payload overwrite attack chain:
 3. `maliciousDVN` verifies with `keccak256("malicious_payload")`
 4. Re-commit via `commitVerification()` overwrites the stored `inboundPayloadHash`
 5. `assertEq(storedAfter, maliciousPayloadHash)` and `assertTrue(storedAfter != legitimatePayloadHash)` both pass
+
+**Test 3: `test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction`**
+
+Demonstrates an alternative destruction path that requires NO external DVN deployment. The delegate chains three built-in protocol operations to permanently destroy a verified message:
+1. `nilify()` changes the stored hash to `NIL_PAYLOAD_HASH`
+2. `skip()` advances `lazyInboundNonce` past the target nonce
+3. `burn()` deletes the hash entirely, making the nonce permanently unrecoverable
+After burn, `_verifiable()` returns false (nonce <= lazyInboundNonce AND hash == EMPTY), so the message can never be re-verified.
 
 Run the tests:
 
