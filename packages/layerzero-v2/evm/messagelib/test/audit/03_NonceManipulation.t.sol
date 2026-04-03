@@ -170,4 +170,156 @@ contract NonceManipulationTest is AuditBase {
         // Both executed successfully - out-of-order verification is fine,
         // but execution must be in order (clearPayload enforces gapless nonces)
     }
+
+    // ==================== AV3.4: Skip Preserves Already-Verified Nonces ====================
+
+    /// @dev Verified nonces remain executable after skip() advances lazyInboundNonce past them
+    function test_AV3_4_SkipPreservesVerifiedNonces() public {
+        bytes32 sender32 = bytes32(uint256(uint160(address(this))));
+
+        // Verify nonces 1 and 2
+        Packet memory packet1 = _makePacket(1, address(this), address(this), "msg1");
+        Packet memory packet2 = _makePacket(2, address(this), address(this), "msg2");
+        (, bytes memory header1, , bytes32 payloadHash1) = _encodeAndSplit(packet1);
+        (, bytes memory header2, , bytes32 payloadHash2) = _encodeAndSplit(packet2);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+        _dvnVerify(dstDvn, dstReceiveUln, header2, payloadHash2, 1);
+        _commitVerification(dstReceiveUln, header2, payloadHash2);
+
+        // Skip nonce 3 (advancing lazyInboundNonce to 3)
+        // inboundNonce = 2 (nonces 1,2 verified), so skip(3) requires 3 == 2+1 ✓
+        dstEndpoint.skip(address(this), SRC_EID, sender32, 3);
+
+        // Nonces 1 and 2 still have their payload hashes
+        bytes32 stored1 = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 1);
+        bytes32 stored2 = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 2);
+        assertEq(stored1, payloadHash1, "Nonce 1 hash preserved after skip");
+        assertEq(stored2, payloadHash2, "Nonce 2 hash preserved after skip");
+
+        // Execute both - should succeed despite skip(3) having advanced lazyInboundNonce
+        Origin memory origin1 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 1 });
+        dstEndpoint.lzReceive(origin1, address(this), packet1.guid, packet1.message, "");
+
+        Origin memory origin2 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 2 });
+        dstEndpoint.lzReceive(origin2, address(this), packet2.guid, packet2.message, "");
+
+        emit log("CONFIRMED: skip() preserves already-verified nonces for execution");
+    }
+
+    // ==================== AV3.5: Burn After Skip Is Permanent Tombstone ====================
+
+    /// @dev Once burned (skip + burn), a nonce can never be re-verified or executed
+    function test_AV3_5_BurnAfterSkipIsPermanent() public {
+        bytes32 sender32 = bytes32(uint256(uint160(address(this))));
+
+        // Verify nonce 1
+        Packet memory packet1 = _makePacket(1, address(this), address(this), "burn_me");
+        (, bytes memory header1, , bytes32 payloadHash1) = _encodeAndSplit(packet1);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+
+        bytes32 storedBefore = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 1);
+        assertEq(storedBefore, payloadHash1, "Nonce 1 should be verified");
+
+        // Skip nonce 2 to advance lazyInboundNonce past nonce 1
+        // inboundNonce = 1 (nonce 1 verified), skip(2) requires 2 == 1+1 ✓
+        dstEndpoint.skip(address(this), SRC_EID, sender32, 2);
+
+        // Burn nonce 1: requires nonce(1) <= lazyInboundNonce(2) and hash != EMPTY
+        dstEndpoint.burn(address(this), SRC_EID, sender32, 1, payloadHash1);
+
+        // Hash should be EMPTY_PAYLOAD_HASH (deleted)
+        bytes32 storedAfter = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 1);
+        assertEq(storedAfter, bytes32(0), "Nonce 1 hash should be cleared after burn");
+
+        // Try to re-verify nonce 1 - should fail with LZ_PathNotVerifiable
+        // _verifiable: nonce(1) > lazyInboundNonce(2) → false; hash == EMPTY → false
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        vm.expectRevert(); // LZ_PathNotVerifiable
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+
+        emit log("CONFIRMED: burn() creates permanent tombstone - re-verification impossible");
+    }
+
+    // ==================== AV3.6: Nilify Then Reverify (Recovery Path) ====================
+
+    /// @dev Nilified nonces can be re-verified as a recovery mechanism
+    function test_AV3_6_NilifyThenReverify() public {
+        bytes32 sender32 = bytes32(uint256(uint160(address(this))));
+
+        // Verify nonce 1
+        Packet memory packet1 = _makePacket(1, address(this), address(this), "recover_me");
+        (, bytes memory header1, , bytes32 payloadHash1) = _encodeAndSplit(packet1);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+
+        // Nilify nonce 1
+        dstEndpoint.nilify(address(this), SRC_EID, sender32, 1, payloadHash1);
+
+        bytes32 nilHash = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 1);
+        assertEq(nilHash, bytes32(type(uint256).max), "Nonce 1 should be NIL_PAYLOAD_HASH");
+
+        // Re-verify with same payload hash - should succeed
+        // _verifiable: nonce(1) > lazyInboundNonce(0) → true
+        // Also: NIL_PAYLOAD_HASH != EMPTY_PAYLOAD_HASH → true (condition B)
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+
+        bytes32 restored = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, sender32, 1);
+        assertEq(restored, payloadHash1, "Nonce 1 hash should be restored after re-verify");
+
+        // Execute - should succeed now
+        Origin memory origin1 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 1 });
+        dstEndpoint.lzReceive(origin1, address(this), packet1.guid, packet1.message, "");
+
+        emit log("CONFIRMED: nilify() allows re-verification as recovery mechanism");
+    }
+
+    // ==================== AV3.7: Execution Blocked By Nonce Gap ====================
+
+    /// @dev Out-of-order verification is fine, but execution requires contiguous nonces
+    function test_AV3_7_ExecutionBlockedByGap() public {
+        bytes32 sender32 = bytes32(uint256(uint160(address(this))));
+
+        // Verify nonces 1 and 3 (skip nonce 2)
+        Packet memory packet1 = _makePacket(1, address(this), address(this), "first");
+        Packet memory packet3 = _makePacket(3, address(this), address(this), "third");
+        (, bytes memory header1, , bytes32 payloadHash1) = _encodeAndSplit(packet1);
+        (, bytes memory header3, , bytes32 payloadHash3) = _encodeAndSplit(packet3);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header1, payloadHash1, 1);
+        _commitVerification(dstReceiveUln, header1, payloadHash1);
+        _dvnVerify(dstDvn, dstReceiveUln, header3, payloadHash3, 1);
+        _commitVerification(dstReceiveUln, header3, payloadHash3);
+
+        // Try to execute nonce 3 - blocked by missing nonce 2
+        Origin memory origin3 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 3 });
+        vm.expectRevert(); // LZ_InvalidNonce(2)
+        dstEndpoint.lzReceive(origin3, address(this), packet3.guid, packet3.message, "");
+
+        // Execute nonce 1 - works fine
+        Origin memory origin1 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 1 });
+        dstEndpoint.lzReceive(origin1, address(this), packet1.guid, packet1.message, "");
+
+        // Nonce 3 still blocked - nonce 2 gap remains
+        vm.expectRevert(); // LZ_InvalidNonce(2)
+        dstEndpoint.lzReceive(origin3, address(this), packet3.guid, packet3.message, "");
+
+        // Fill the gap: verify nonce 2
+        Packet memory packet2 = _makePacket(2, address(this), address(this), "second");
+        (, bytes memory header2, , bytes32 payloadHash2) = _encodeAndSplit(packet2);
+        _dvnVerify(dstDvn, dstReceiveUln, header2, payloadHash2, 1);
+        _commitVerification(dstReceiveUln, header2, payloadHash2);
+
+        // Now execute nonces 2 and 3 - both succeed
+        Origin memory origin2 = Origin({ srcEid: SRC_EID, sender: sender32, nonce: 2 });
+        dstEndpoint.lzReceive(origin2, address(this), packet2.guid, packet2.message, "");
+        dstEndpoint.lzReceive(origin3, address(this), packet3.guid, packet3.message, "");
+
+        emit log("CONFIRMED: Ordered execution enforced - gaps block delivery until filled");
+    }
 }

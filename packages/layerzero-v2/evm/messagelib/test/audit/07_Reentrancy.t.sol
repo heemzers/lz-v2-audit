@@ -117,6 +117,15 @@ contract ReentrancyTest is AuditBase {
         // because lzReceive doesn't set sendContext
         assertTrue(true, "Send during receive is a legitimate pattern");
     }
+
+    // ==================== AV7.4: Compose Safety (Verified by Code Review) ====================
+    // MessagingComposer.lzCompose() writes RECEIVED_MESSAGE_HASH (line 56) BEFORE the
+    // external call to the OApp handler (line 57). However, since lzCompose() has NO
+    // try/catch, a handler revert propagates and reverts the state write too.
+    // This means compose entries are NOT permanently consumed on handler failure.
+    // The Executor.compose302() uses try/catch around endpoint.lzCompose(), but since
+    // the state write is INSIDE the called frame, it still reverts on failure.
+    // CONCLUSION: Compose queue is safe from permanent consumption griefing.
 }
 
 /// @dev Helper contract that attempts reentrancy during lzReceive
