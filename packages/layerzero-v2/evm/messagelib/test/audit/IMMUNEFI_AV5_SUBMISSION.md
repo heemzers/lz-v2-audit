@@ -135,13 +135,9 @@ Demonstrates the full payload overwrite attack chain:
 4. Re-commit via `commitVerification()` overwrites the stored `inboundPayloadHash`
 5. `assertEq(storedAfter, maliciousPayloadHash)` and `assertTrue(storedAfter != legitimatePayloadHash)` both pass
 
-**Test 3: `test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction`**
+**Test 3: `test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction`** (supplementary)
 
-Demonstrates an alternative destruction path that requires NO external DVN deployment. The delegate chains three built-in protocol operations to permanently destroy a verified message:
-1. `nilify()` changes the stored hash to `NIL_PAYLOAD_HASH`
-2. `skip()` advances `lazyInboundNonce` past the target nonce
-3. `burn()` deletes the hash entirely, making the nonce permanently unrecoverable
-After burn, `_verifiable()` returns false (nonce <= lazyInboundNonce AND hash == EMPTY), so the message can never be re-verified.
+Demonstrates an alternative destruction path using only built-in protocol operations (no external DVN deployment). The delegate chains nilify → skip → burn to permanently destroy a verified message. This test is supplementary — it demonstrates the breadth of delegate power and supports the recommendation for timelocked config/operation changes rather than being a standalone finding.
 
 Run the tests:
 

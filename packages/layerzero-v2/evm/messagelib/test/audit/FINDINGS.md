@@ -82,7 +82,7 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 **Note:** This is the same root cause as the payload overwrite above but demonstrates the quorum reduction angle rather than the payload overwrite angle.
 
-### [HIGH] Delegate Nilify-Skip-Burn - Permanent Message Destruction (AV5.7)
+### [MEDIUM-HIGH] Delegate Nilify-Skip-Burn - Permanent Message Destruction (AV5.7)
 
 **Files:**
 - `protocol/contracts/MessagingChannel.sol:95-105` (nilify - sets hash to NIL_PAYLOAD_HASH)
@@ -101,7 +101,9 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 4. Delegate calls `burn(oapp, srcEid, sender, 1, NIL_PAYLOAD_HASH)` - deletes hash permanently
 5. Nonce 1 is permanently dead: `_verifiable()` returns false, no re-verification possible
 
-**Why This Matters:** Unlike the config retroactivity attack (AV5.6), this path requires NO external DVN deployment. The delegate uses only built-in protocol operations (nilify, skip, burn) in their intended sequence, but the cumulative effect is permanent fund destruction. Each operation individually seems safe; the chain is the vulnerability.
+**Why This Matters:** Unlike the config retroactivity attack (AV5.6), this path requires NO external DVN deployment. The delegate uses only built-in protocol operations (nilify, skip, burn) in their intended sequence, but the cumulative effect is permanent message destruction. Each operation individually is an intended delegate capability; the concern is that a single-key compromise enables irreversible damage with no timelock or rate-limiting.
+
+**Mitigating factor:** Nilify, skip, and burn are designed delegate powers. This is a trust model concern (delegate has too much instant, untimelocked power) rather than a logic bug.
 
 ---
 

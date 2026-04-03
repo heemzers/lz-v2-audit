@@ -269,9 +269,10 @@ contract AccessControlTest is AuditBase {
     }
 
     // ==================== AV5.7: Delegate nilify->skip->burn Permanently Destroys Verified Message ====================
-    /// @dev CRITICAL: A compromised delegate can permanently destroy a verified message using
+    /// @dev A compromised delegate can permanently destroy a verified message using
     ///      a chain of nilify -> skip -> burn. After burn, the nonce is permanently unexecutable
     ///      and un-verifiable: lazyInboundNonce has advanced past it and the hash is EMPTY.
+    ///      Fund loss occurs if the destroyed message carried a value transfer (e.g., OFT bridge).
     function test_AV5_7_DelegateNilifySkipBurn_PermanentDestruction() public {
         address delegate = address(0xDE1E);
         dstEndpoint.setDelegate(delegate);
@@ -309,24 +310,27 @@ contract AccessControlTest is AuditBase {
         bytes32 afterBurn = dstEndpoint.inboundPayloadHash(address(this), SRC_EID, senderBytes32, 1);
         assertEq(afterBurn, EMPTY_PAYLOAD_HASH, "Hash must be EMPTY after burn");
 
-        // Step 7: Verify nonce 1 can never be re-verified
-        // lazyInboundNonce == 2, nonce 1 <= 2, and hash == EMPTY -> permanently destroyed
+        // Step 7: Directly verify the nonce is permanently unverifiable via protocol check
+        Origin memory origin = Origin(SRC_EID, senderBytes32, 1);
+        bool canVerify = dstEndpoint.verifiable(origin, address(this));
+        assertFalse(canVerify, "Nonce 1 must be permanently unverifiable after burn");
+
+        // Confirm: lazyInboundNonce advanced past nonce 1
         uint64 lazy = dstEndpoint.lazyInboundNonce(address(this), SRC_EID, senderBytes32);
         assertEq(lazy, 2, "lazyInboundNonce should be 2 after skip");
-        assertTrue(1 <= lazy, "Nonce 1 is at or below lazyInboundNonce -- cannot be re-verified");
-        assertEq(afterBurn, EMPTY_PAYLOAD_HASH, "Nonce 1 hash is EMPTY -- re-verify would write into already-consumed slot");
 
         emit log("CONFIRMED: Delegate nilify->skip->burn permanently destroys verified message");
         emit log("1. Legitimate message committed at nonce 1");
         emit log("2. Delegate nilify: hash set to NIL_PAYLOAD_HASH");
         emit log("3. Delegate skip(2): lazyInboundNonce advanced to 2");
-        emit log("4. Delegate burn(1): nonce 1 hash deleted -- EMPTY, nonce <= lazyInboundNonce");
-        emit log("5. Nonce 1 is permanently unexecutable and un-verifiable -- FUND LOSS");
+        emit log("4. Delegate burn(1): nonce 1 hash deleted, nonce <= lazyInboundNonce");
+        emit log("5. Nonce 1 is permanently unverifiable -- message lost");
     }
 
     // ==================== AV5.8: Delegate SendLib Swap Blocks Outbound ====================
-    /// @dev CRITICAL: A compromised delegate can block all outbound messages by swapping
+    /// @dev A compromised delegate can block all outbound messages by swapping
     ///      the send library to the blockedLibrary. Any subsequent send() call reverts.
+    ///      Recoverable if the OApp owner can call setSendLibrary() directly.
     function test_AV5_8_DelegateSendLibSwap_BlocksOutbound() public {
         address delegate = address(0xDE1E);
 
