@@ -17,7 +17,8 @@
 
 **Impact:** Permanent locking/loss of user funds. An attacker with access to a deprecated (but still valid during grace period) receive library's DVN quorum can overwrite the payloadHash of a legitimately verified message, making the original message permanently unexecutable.
 
-**PoC:** `test/audit/06_GracePeriod.t.sol::test_AV6_3_PayloadOverwriteViaGracePeriod`
+**PoC (discovery):** `test/audit/06_GracePeriod.t.sol::test_AV6_3_PayloadOverwriteViaGracePeriod`
+**PoC (submission-ready):** `test/audit/09_CriticalPoC.t.sol::test_CRITICAL_PermanentFundLocking`
 
 **Description:**
 1. During a receive library upgrade with a grace period, BOTH old and new libraries are valid callers of `EndpointV2.verify()`
@@ -36,6 +37,16 @@
 - A receive library upgrade with grace period > 0 blocks
 - Control of the DVN quorum on the OLD (deprecated) library
 - Target message must be verified but not yet executed
+
+**Recovery Path Analysis:**
+All endpoint recovery functions fail for the original message after overwrite:
+- `lzReceive()` reverts with `LZ_PayloadHashNotFound` (hash mismatch)
+- `clear()` reverts with `LZ_PayloadHashNotFound` (hash mismatch)
+- `nilify(originalHash)` reverts (stored hash is malicious, not original)
+- `burn(originalHash)` reverts (stored hash is malicious, not original)
+- `skip()` only works for the next unverified nonce, cannot help
+
+The OApp admin can nilify/burn using the malicious hash to "clean up" the slot, but the original message data is permanently lost. Tokens burned/locked on the source chain can never be credited on the destination chain.
 
 **Recommendation:**
 - `_inbound()` should NOT overwrite existing non-empty payload hashes, or
