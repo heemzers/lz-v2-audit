@@ -3,7 +3,7 @@
 **Program:** Immunefi LayerZero-v2 ($250K-$15M for critical)
 **Scope:** Theft or permanent locking of user funds
 **Started:** 2026-04-02
-**Updated:** 2026-04-03
+**Updated:** 2026-04-03 (session 3)
 
 ---
 
@@ -246,6 +246,22 @@ All five edge cases tested (no default config, DVN array mismatch, NIL_DVN_COUNT
 ### Reentrancy Protection Is Solid (AV7)
 CEI pattern is consistently applied. `lzReceive` clears payload before external call. `sendContext` modifier prevents re-entry to `send()`. ReentrantReceiver test confirms protection.
 
+### Compose Queue Is Safe From Permanent Consumption Griefing (AV7.4)
+`MessagingComposer.lzCompose()` writes `RECEIVED_MESSAGE_HASH` (line 56) BEFORE the external call to the OApp handler (line 57). However, since `lzCompose()` has NO try/catch, a handler revert propagates and reverts the state write too. The Executor's `compose302()` uses try/catch around `endpoint.lzCompose()`, but since the state write is INSIDE the called frame, it still reverts on failure. Compose entries are NOT permanently consumed on handler failure.
+
+### GUID Uniqueness Is Guaranteed
+`GUID.generate()` uses `keccak256(abi.encodePacked(nonce, srcEid, sender32, dstEid, receiver))` with all fixed-size fields. `sender` is padded to `bytes32` via `AddressCast.toBytes32()`, eliminating `abi.encodePacked` boundary ambiguity. Nonce monotonicity per `(sender, dstEid, receiver)` path ensures no GUID collision.
+
+### Compose Queue Has No Ordering Enforcement
+Compose indices can be executed in any order. Index 5 can execute before index 0 with no revert. OApps that implement stateful compose handlers assuming sequential execution bear the ordering risk. This is a documented design choice.
+
+### Nonce System Is Sound (AV3.4-3.7)
+- `skip()` preserves already-verified nonces for later execution (AV3.4)
+- `burn()` creates permanent tombstone: nonce(N) <= lazyInboundNonce AND hash == EMPTY means `_verifiable()` returns false forever (AV3.5)
+- `nilify()` allows re-verification as a recovery mechanism because NIL_PAYLOAD_HASH != EMPTY_PAYLOAD_HASH (AV3.6)
+- Execution requires contiguous nonces: gaps block delivery until filled via verification or nilification (AV3.7)
+- No double-execution vulnerability exists: `_clearPayload()` deletes hash before OApp receives control
+
 ---
 
 ## Bounty Submission Strategy
@@ -280,11 +296,11 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
 |------|-------|--------|
 | 01_QuorumBypass.t.sol | 7 | ALL PASS |
 | 02_SignatureReplay.t.sol | 5 | ALL PASS |
-| 03_NonceManipulation.t.sol | 3 | ALL PASS |
+| 03_NonceManipulation.t.sol | 7 | ALL PASS |
 | 04_FeeExploit.t.sol | 6 | ALL PASS |
 | 05_AccessControl.t.sol | 11 | ALL PASS |
 | 06_GracePeriod.t.sol | 4 | ALL PASS |
 | 07_Reentrancy.t.sol | 3 | ALL PASS |
 | 08_LzTokenDrain.t.sol | 3 | ALL PASS |
 | 09_CriticalPoC.t.sol | 3 | ALL PASS |
-| **TOTAL** | **45** | **ALL PASS** |
+| **TOTAL** | **49** | **ALL PASS** |
