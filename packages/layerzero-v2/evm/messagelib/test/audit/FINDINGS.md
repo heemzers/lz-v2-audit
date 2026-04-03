@@ -3,11 +3,41 @@
 **Program:** Immunefi LayerZero-v2 ($250K-$15M for critical)
 **Scope:** Theft or permanent locking of user funds
 **Started:** 2026-04-02
-**Updated:** 2026-04-03 (session 3)
+**Updated:** 2026-04-03 (session 4)
 
 ---
 
 ## Critical Findings
+
+### [CRITICAL] lzToken Front-Running Attack (AV4)
+
+**Status:** PoC confirmed, ready for submission
+**Submission:** `test/audit/IMMUNEFI_AV4_SUBMISSION.md`
+**Files:**
+- `protocol/contracts/EndpointV2.sol:287-297` (_suppliedLzToken - uses balanceOf)
+- `protocol/contracts/EndpointV2.sol:244-260` (_payToken - refund mechanism)
+- `protocol/contracts/EndpointV2Alt.sol:39-41` (Alt: same pattern for native token)
+
+**Impact:** Direct theft of user lzToken deposits via front-running. An attacker with no special permissions (any EOA) can steal lzTokens pre-deposited by a victim to the endpoint by front-running the victim's `send()` call with their own. No access control required.
+
+**Root Cause:** `_suppliedLzToken()` reads `IERC20(lzToken).balanceOf(address(this))` as the "supplied" amount, which is shared global state across ALL callers. Any lzToken balance in the endpoint — regardless of who deposited it — is credited to the next caller who invokes `send(payInLzToken=true)`.
+
+**Attack Flow:**
+1. Victim calls `lzToken.transfer(endpoint, amount)` (pre-deposit, non-atomic path)
+2. Attacker observes the deposit in the mempool
+3. Attacker front-runs with `endpoint.send(payInLzToken=true, ...)` using their own message
+4. `_suppliedLzToken()` returns the victim's deposited balance; attacker's send is fully funded
+5. Victim's subsequent `send()` call fails: `_suppliedLzToken()` returns 0 (tokens already consumed)
+
+**Also Affects:** `EndpointV2Alt._suppliedNative()` uses the same `balanceOf(address(this))` pattern for native ERC20 fees on Alt chains. Affects ALL messages on Alt chains (not just lzToken-paying ones), making the Alt variant more severe in practice.
+
+**No Privilege Required:** Unlike AV5 (delegate compromise) or AV2 (DVN key compromise), this requires only a standard EOA and mempool observation. Any user can exploit any other user's non-atomic deposit.
+
+**Tests:** `test_AV4_3`, `test_AV4_7`, `test_AV4_8`, `test_AV4_9`
+
+**Recommendation:** Replace balance-based supply measurement with `transferFrom` + approval, or add per-sender deposit tracking (e.g., a mapping `pendingLzToken[sender]` credited on transfer and debited on send).
+
+---
 
 ### [CRITICAL] Payload Overwrite via Grace Period + Reverification (AV3+AV6)
 
@@ -27,6 +57,31 @@
 ---
 
 ## High Findings
+
+### [HIGH] DVN Shared-VID Signature Replay (AV2)
+
+**Status:** PoC confirmed
+**Submission:** `test/audit/IMMUNEFI_AV2_SUBMISSION.md`
+**Files:**
+- `messagelib/contracts/uln/dvn/DVNMultiSig.sol` (hashCallData - omits chain_id and address(this))
+- `messagelib/contracts/uln/dvn/DVN.sol:386-392` (_shouldCheckHash - bypasses usedHashes for verify selector)
+
+**Impact:** Effective DVN quorum is silently halved without OApp awareness. An attacker who controls DVN signers on one chain can replay their signatures on a second chain that shares the same VID (verification ID), causing a message to appear verified by the required quorum when in fact all signatures originate from a single chain's signer set.
+
+**Root Cause:** `hashCallData()` does not include `chain_id` or `address(this)` in the signed payload. Signatures are therefore valid on any chain where the same VID is deployed. Compounding this, the `verify` selector is explicitly excluded from `_shouldCheckHash`, meaning `usedHashes` replay protection does not apply to verification calls — a signature bundle can be reused indefinitely across chains.
+
+**Attack Flow:**
+1. Attacker observes a valid DVN signature bundle from chain A (VID deployed on chains A and B)
+2. Replays the same signature bundle on chain B's DVN contract
+3. `hashCallData()` produces the same digest (no chain_id / address(this) binding)
+4. DVN quorum check passes on chain B using chain A's signers
+5. Message on chain B appears verified by the required quorum; OApp has no way to detect the replay
+
+**Tests:** `test_AV2_5`, `test_AV2_6`, `test_AV2_2b`
+
+**Recommendation:** Include `block.chainid` and `address(this)` in `hashCallData()` so that signatures are bound to a specific chain and DVN contract instance. Apply `usedHashes` protection to the `verify` selector.
+
+---
 
 ### [HIGH] Delegate Config Retroactivity - Payload Overwrite Without Grace Period (AV5+AV1)
 
@@ -208,6 +263,20 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 ## Observations (Not Vulnerabilities)
 
+### AV1 — NIL_CONFIRMATIONS Resolves to 0 (AV1.2–AV1.7)
+
+**Not submittable.** Setting `confirmations = NIL_CONFIRMATIONS` (resolving to 0 at read time) requires either the OApp owner or a delegate to configure it. This is a trust violation by the OApp's own authorized config principals, not an external attacker capability. The protocol's threat model treats the OApp owner and delegate as trusted parties. No economic path exists for an unprivileged attacker to trigger this.
+
+**Tests:** `test_AV1_2`, `test_AV1_3`, `test_AV1_4`, `test_AV1_5`, `test_AV1_6`, `test_AV1_7`
+
+**Note:** `test_AV1_6` (NIL_CONFIRMATIONS validation asymmetry between default and OApp configs) remains documented as a medium finding above due to the inconsistent validation, but the direct quorum bypass path is not submittable.
+
+### AV4 — Treasury lzToken Over-Withdrawal (AV4.4, AV4.5)
+
+**Not submittable.** `withdrawLzTokenFee()` has no accounting guard and accepts a caller-supplied `_lzToken` address, allowing the treasury to drain any ERC20 from SendLib. This requires the treasury owner key — a centralization/trust assumption explicitly accepted in the protocol design. The `fees` mapping only tracks native fees; lzToken accounting is intentionally off-chain.
+
+**Tests:** `test_AV4_4`, `test_AV4_5`
+
 ### DVN Overlap in Required/Optional Lists (AV1.4)
 Same DVN in both required and optional lists passes `_assertAtLeastOneDVN` but effective quorum is 1, not 2.
 **PoC:** `test/audit/01_QuorumBypass.t.sol::test_AV1_4_DVNOverlapRequiredOptional`
@@ -270,19 +339,28 @@ Compose indices can be executed in any order. Index 5 can execute before index 0
 1. **AV3+AV6 (CRITICAL):** Payload overwrite via grace period + reverification
 
 ### Ready to Submit
-2. **AV5+AV1 (HIGH):** Delegate config retroactivity + payload overwrite without grace period
+2. **AV4 (CRITICAL):** lzToken front-running — direct theft, no privilege required
+   - `IMMUNEFI_AV4_SUBMISSION.md`
+   - Also affects EndpointV2Alt (all messages on alt-native chains)
+3. **AV2 (HIGH):** DVN shared-VID signature replay — effective quorum halved cross-chain
+   - `IMMUNEFI_AV2_SUBMISSION.md`
+   - `hashCallData()` missing `chain_id` + `address(this)`; verify selector bypasses usedHashes
+4. **AV5+AV1 (HIGH):** Delegate config retroactivity + payload overwrite without grace period
    - Different root cause than AV3+AV6 (config manipulation vs. library upgrade)
    - Demonstrates that `_inbound()` overwrite is exploitable through MULTIPLE paths
    - Strong case for fixing `_inbound()` rather than just the grace period path
-3. **AV5.7 (HIGH):** Delegate nilify-skip-burn permanent message destruction
+5. **AV5.7 (HIGH):** Delegate nilify-skip-burn permanent message destruction
    - No external DVN needed -- uses only built-in protocol operations
    - 3-step chain: nilify -> skip -> burn permanently kills a verified nonce
    - Strengthens AV5 submission by showing delegate power extends beyond config manipulation
 
 ### Consider Submitting
-4. **AV5.10 (MEDIUM-HIGH):** Nilified nonce resurrection via re-verification
-5. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
-6. **AV4.3 (MEDIUM):** lzToken balance race condition
+6. **AV5.10 (MEDIUM-HIGH):** Nilified nonce resurrection via re-verification
+7. **AV1.6 (MEDIUM):** NIL_CONFIRMATIONS validation asymmetry
+
+### Not Submittable (By Design / Trust Assumption)
+- **AV1 quorum bypass (AV1.2–AV1.7):** Requires OApp/delegate trust violation — by design
+- **AV4.4/4.5 (treasury drain):** Requires treasury owner key — trust assumption
 
 ### Supplementary Evidence (bundle with AV5 submission)
 - **AV5.9 (MEDIUM):** Config persistence after delegate revocation — strengthens AV5 case
