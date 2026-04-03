@@ -44,7 +44,9 @@
 
 This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace period or library upgrade. It exploits the config retroactivity: ULN config is read at `commitVerification()` time, not at DVN verification time.
 
-**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_6_PayloadOverwriteViaConfigChangeAndReverify`
+**PoC:**
+- `test/audit/05_AccessControl.t.sol::test_AV5_6_PayloadOverwriteViaConfigChangeAndReverify` (hash overwrite)
+- `test/audit/05_AccessControl.t.sol::test_AV5_11_EndToEndFundLoss` (full fund loss: lzReceive reverts + all recovery paths fail)
 
 **Attack Flow:**
 1. Legitimate message verified and committed by honest DVNs
@@ -280,9 +282,9 @@ CEI pattern is consistently applied. `lzReceive` clears payload before external 
 | 02_SignatureReplay.t.sol | 5 | ALL PASS |
 | 03_NonceManipulation.t.sol | 3 | ALL PASS |
 | 04_FeeExploit.t.sol | 6 | ALL PASS |
-| 05_AccessControl.t.sol | 10 | ALL PASS |
+| 05_AccessControl.t.sol | 11 | ALL PASS |
 | 06_GracePeriod.t.sol | 4 | ALL PASS |
 | 07_Reentrancy.t.sol | 3 | ALL PASS |
 | 08_LzTokenDrain.t.sol | 3 | ALL PASS |
 | 09_CriticalPoC.t.sol | 3 | ALL PASS |
-| **TOTAL** | **44** | **ALL PASS** |
+| **TOTAL** | **45** | **ALL PASS** |
