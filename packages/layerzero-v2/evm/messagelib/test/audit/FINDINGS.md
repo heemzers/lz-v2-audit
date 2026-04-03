@@ -261,6 +261,30 @@ This is a SEPARATE attack path from AV3+AV6 because it does NOT require a grace 
 
 ---
 
+### [MEDIUM] Double Library Migration Silently Evicts Grace Period (AV6.5)
+
+**Status:** PoC confirmed
+**Files:**
+- `protocol/contracts/MessageLibManager.sol:245-273` (setReceiveLibrary - single timeout slot overwrite)
+
+**Impact:** Calling `setReceiveLibrary()` twice rapidly silently deletes the first library's grace period. The `receiveLibraryTimeout` mapping stores only ONE `Timeout` struct per `(oapp, eid)`. A second migration overwrites this slot, instantly evicting the first library with no on-chain warning. Any messages that were verified-but-not-committed on the evicted library become permanently undeliverable — `commitVerification()` calls `endpoint.verify()` which checks `isValidReceiveLibrary()`, and the evicted library fails this check forever.
+
+**Attack Flow:**
+1. OApp migrates from libA to libB with grace period (libA enters timeout slot)
+2. DVN verifies a message on libA during the grace period (hashLookup populated)
+3. OApp migrates from libB to libC with grace period (libB enters timeout slot, libA's timeout DELETED)
+4. libA is now permanently invalid — not current, not in timeout
+5. `commitVerification()` on libA reverts — message permanently stranded
+6. If this was an OFT transfer: tokens burned on source, never minted on destination
+
+**PoC:** `test/audit/06_GracePeriod.t.sol::test_AV6_5_DoubleMigrationEvictsGracePeriod`
+
+**Note:** Requires OApp or delegate to perform two rapid migrations. This is a design footgun — even honest operators performing emergency library rotations can accidentally trigger it. A malicious delegate could weaponize it to permanently strand in-flight messages.
+
+**Recommendation:** Either maintain a list of active timeouts instead of a single slot, or require the previous grace period to expire before allowing a new migration.
+
+---
+
 ## Observations (Not Vulnerabilities)
 
 ### AV1 — NIL_CONFIRMATIONS Resolves to 0 (AV1.2–AV1.7)
