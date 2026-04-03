@@ -153,7 +153,7 @@ Run the tests:
 forge test --match-path test/audit/05_AccessControl.t.sol -vvv
 ```
 
-All 10 tests pass, confirming the vulnerabilities exist in the current codebase.
+All 11 tests pass, confirming the vulnerabilities exist in the current codebase.
 
 ## Distinction from Previously Submitted Finding (AV3+AV6)
 
