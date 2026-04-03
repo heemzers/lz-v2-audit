@@ -174,6 +174,35 @@ In a 2-of-2 quorum: DVN1 verifies -> DVN2 verifies -> DVN1 retracts to 0 -> `com
 
 ---
 
+### [MEDIUM-HIGH] Delegate Permanently Destroys Verified In-Flight Messages via skip+burn (AV5.7)
+
+**Files:**
+- `protocol/contracts/MessagingChannel.sol:82-88` (skip)
+- `protocol/contracts/MessagingChannel.sol:112-121` (burn)
+- `protocol/contracts/EndpointV2.sol:354-357` (_assertAuthorized)
+
+**Impact:** A compromised delegate can permanently destroy verified, unexecuted messages by chaining `skip()` + `burn()`, causing irreversible fund loss. Tokens locked/burned on the source chain can never be credited on the destination chain.
+
+**PoC:** `test/audit/05_AccessControl.t.sol::test_AV5_7_DelegateDestroysVerifiedMessage_SkipBurn` (PASSING)
+
+**Description:**
+1. Message at nonce N is verified (inboundPayloadHash != EMPTY) but not yet executed
+2. Delegate calls `skip(oapp, srcEid, sender, N+1)` - advances `lazyInboundNonce` to N+1
+3. `skip()` only checks `_nonce == inboundNonce() + 1` - does NOT guard against orphaning verified payloads
+4. Delegate calls `burn(oapp, srcEid, sender, N, payloadHash)` - permanently deletes the verified payload
+5. `burn()` passes because: `curPayloadHash != EMPTY` (true) AND `_nonce <= lazyInboundNonce` (N <= N+1, true after step 2)
+6. After burn: slot is EMPTY, `_verifiable()` returns false, re-verification blocked, lzReceive reverts
+
+**Root cause:** `skip()` advances `lazyInboundNonce` without checking whether any prior nonces have verified-but-unexecuted payloads, unlocking `burn()` for those messages.
+
+**Note:** Requires compromised delegate. However, the combination of skip+burn creating permanent, irrecoverable fund loss (worse than just config downgrade) elevates this above AV5.5.
+
+**Recommendation:**
+- `skip()` should check that no verified payloads exist at nonces below the skip target, or
+- `burn()` should not delete the payload hash but instead mark it as burned in a way that prevents re-verification while preserving recoverability
+
+---
+
 ## Observations (Not Vulnerabilities)
 
 ### DVN Overlap in Required/Optional Lists (AV1.3)
